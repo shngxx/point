@@ -1,74 +1,76 @@
 package main
 
 import (
-	"context"
-	"flag"
-	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/shngxx/point/internal/container"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/websocket/v2"
 	httphandler "github.com/shngxx/point/internal/http"
+	"github.com/shngxx/point/internal/infrastructure/db"
 	"github.com/shngxx/point/internal/usecase"
 	"github.com/shngxx/point/internal/ws"
+	"github.com/shngxx/point/pkg/config"
 	"github.com/shngxx/point/pkg/di"
+	"github.com/shngxx/point/pkg/http"
+	httphooks "github.com/shngxx/point/pkg/http/hooks"
+	logging "github.com/shngxx/point/pkg/log"
+	wsmanager "github.com/shngxx/point/pkg/ws"
 )
 
-var c *di.Container
-
 func main() {
-	addr := flag.String("addr", ":8080", "Адрес сервера")
-	flag.Parse()
+	var cfg AppConfig
+	config.LoadDefault(&cfg)
 
-	// Настройка контейнера
-	c = di.NewContainer()
-	container.SetupContainer(c)
+	// Setup DI container
+	c := di.NewContainer()
+	c.Provide(
+		logging.New,
+		wsmanager.NewManagerWithDefaults,
+		http.NewWithDefaults,
+		db.NewPointRepository,
+		usecase.NewGetPointUC,
+		usecase.NewMovePointUC,
+		ws.NewHandler,
+		httphandler.NewGetPointHandler,
+	)
 
-	// Настройка роутера
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
+	// Register dependencies for server
+	c.Supply(
+		cfg.Server,
+		cfg.Logger,
+		usecase.MovePointConfig{
+			BatchInterval: cfg.Point.BatchIntervalDuration(),
+			SaveInterval:  cfg.Point.SaveIntervalDuration(),
+		},
+	)
 
-	// Регистрация маршрутов
-	r.Get("/ws", di.MustResolveType[*ws.Handler](c).HandleWebSocket)
-	r.Get("/api/point/{id}", httphandler.NewGetPointHandler(di.MustResolveType[*usecase.GetPointUC](c)))
+	// Get dependencies from DI
+	server := di.MustResolve[*http.Server](c)
+	wsManager := di.MustResolve[*wsmanager.Manager](c)
 
-	// Создаем HTTP сервер
-	srv := &http.Server{
-		Addr:    *addr,
-		Handler: r,
-	}
+	// Register all routes in a centralized location (routes.go)
+	// Routes resolve their handlers from DI container automatically
+	registerRoutes(server, c)
 
-	// Канал для получения сигналов ОС
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	// Register shutdown hook for WebSocket manager
+	server.AddHook(httphooks.BeforeShutdown, func() error {
+		return wsManager.Shutdown()
+	})
 
-	// Запускаем сервер в отдельной горутине
-	go func() {
-		log.Printf("Сервер запущен на %s", *addr)
-		log.Printf("Веб-интерфейс доступен по адресу http://localhost%s", *addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Ошибка запуска сервера: %v", err)
-		}
-	}()
+	// Start server
+	server.Start()
+}
 
-	// Ожидаем сигнал для graceful shutdown
-	sig := <-sigChan
-	log.Printf("Получен сигнал: %v. Начинаем graceful shutdown...", sig)
+func registerRoutes(server *http.Server, c *di.Container) {
+	// ============================================================================
+	// WebSocket Routes
+	// ============================================================================
+	wsHandler := di.MustResolve[*ws.Handler](c)
+	server.App().Get("/ws", websocket.New(wsHandler.Manager().HandleConnection))
 
-	// Создаем контекст с таймаутом для graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// ============================================================================
+	// Point API Routes
+	// ============================================================================
+	getPointHandler := di.MustResolve[fiber.Handler](c)
+	server.GET("/api/point/:id", getPointHandler)
+	server.GET("/api/point", getPointHandler) // For case when id is not specified
 
-	// Останавливаем сервер
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("Ошибка при остановке сервера: %v", err)
-	} else {
-		log.Println("Сервер успешно остановлен")
-	}
 }

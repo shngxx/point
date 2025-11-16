@@ -1,7 +1,1 @@
-node_modules/
-dist/
-web/*.js
-web/*.map
-.DS_Store
-*.log
-
+cmd/app/config.yaml

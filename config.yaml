@@ -1,0 +1,15 @@
+server:
+  host:
+  port:
+  readTimeout:
+  writeTimeout:
+
+logger:
+  level:
+  sentryDSN:
+  sentryEnvironment:
+  sentryRelease:
+  sentrySampleRate:
+  prettyPrint:
+
+
